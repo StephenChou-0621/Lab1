@@ -32,7 +32,8 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-
+#define MSG_SHORT 1
+#define MSG_LONG  2
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -70,15 +71,15 @@ const osThreadAttr_t myTask02_attributes = {
   .stack_size = 128 * 4,
   .priority = (osPriority_t) osPriorityNormal,
 };
+/* Definitions for buttonQueue */
+osMessageQueueId_t buttonQueueHandle;
+const osMessageQueueAttr_t buttonQueue_attributes = {
+  .name = "buttonQueue"
+};
 /* Definitions for ledMutex */
 osMutexId_t ledMutexHandle;
 const osMutexAttr_t ledMutex_attributes = {
   .name = "ledMutex"
-};
-/* Definitions for buttonSem */
-osSemaphoreId_t buttonSemHandle;
-const osSemaphoreAttr_t buttonSem_attributes = {
-  .name = "buttonSem"
 };
 /* Definitions for timerSem */
 osSemaphoreId_t timerSemHandle;
@@ -164,9 +165,6 @@ int main(void)
   /* USER CODE END RTOS_MUTEX */
 
   /* Create the semaphores(s) */
-  /* creation of buttonSem */
-  buttonSemHandle = osSemaphoreNew(1, 1, &buttonSem_attributes);
-
   /* creation of timerSem */
   timerSemHandle = osSemaphoreNew(1, 1, &timerSem_attributes);
 
@@ -177,6 +175,10 @@ int main(void)
   /* USER CODE BEGIN RTOS_TIMERS */
   /* start timers, add new ones, ... */
   /* USER CODE END RTOS_TIMERS */
+
+  /* Create the queue(s) */
+  /* creation of buttonQueue */
+  buttonQueueHandle = osMessageQueueNew (4, sizeof(uint8_t), &buttonQueue_attributes);
 
   /* USER CODE BEGIN RTOS_QUEUES */
   /* add queues, ... */
@@ -634,7 +636,7 @@ static void MX_GPIO_Init(void)
 
   /*Configure GPIO pin : PC13 */
   GPIO_InitStruct.Pin = GPIO_PIN_13;
-  GPIO_InitStruct.Mode = GPIO_MODE_IT_FALLING;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING_FALLING;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
 
@@ -771,15 +773,26 @@ static void MX_GPIO_Init(void)
 /* USER CODE BEGIN 4 */
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 {
-  static uint32_t last_tick = 0;
-  if (GPIO_Pin == GPIO_PIN_13)
+  static uint32_t press_tick = 0;   // 按下的時間
+  static uint32_t last_tick = 0;    // 上次有效觸發的時間（去彈跳用）
+  static uint8_t  pressed = 0;      // 是否已記錄到按下
+
+  if (GPIO_Pin != GPIO_PIN_13) return;          // 不是按鈕就離開
+
+  uint32_t now = HAL_GetTick();
+  if (now - last_tick < 50) return;             // 50 ms 內的視為彈跳
+  last_tick = now;
+
+  if (HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_13) == GPIO_PIN_RESET)  // 低電位 = 按下
   {
-    uint32_t now = HAL_GetTick();
-    if (now - last_tick > 200) // 200 ms = press buttum time
-    {
-      last_tick = now;
-      osSemaphoreRelease(buttonSemHandle); // release to inform task 1 or 2
-    }
+    press_tick = now;                           // 記下按下時間
+    pressed = 1;
+  }
+  else if (pressed)                             // 高電位 = 放開（且之前有按下）
+  {
+    pressed = 0;
+    uint8_t msg = (now - press_tick >= 1000) ? MSG_LONG : MSG_SHORT;
+    osMessageQueuePut(buttonQueueHandle, &msg, 0, 0);  // 丟進 queue；中斷裡 timeout 必須是 0
   }
 }
 /* USER CODE END 4 */
@@ -794,19 +807,24 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 void StartTask1(void *argument)
 {
   /* USER CODE BEGIN 5 */
-  osSemaphoreAcquire(buttonSemHandle, 0);               // 清掉初始值
+  uint8_t msg;
   for(;;)
   {
-    osSemaphoreAcquire(buttonSemHandle, osWaitForever); // 等按鈕 (release from callback)
-    osMutexAcquire(ledMutexHandle, osWaitForever);      // 拿鑰匙
-    for (int i = 0; i < 5; i++)                         // 1 Hz x 5 秒
+    osMessageQueueGet(buttonQueueHandle, &msg, NULL, osWaitForever);  // 等訊息
+
+    uint32_t half, times;
+    if (msg == MSG_LONG) { half = 50;  times = 50; }  // 長按：10 Hz x 5 秒
+    else                 { half = 500; times = 5;  }  // 短按：1 Hz x 5 秒
+
+    osMutexAcquire(ledMutexHandle, osWaitForever);
+    for (uint32_t i = 0; i < times; i++)
     {
-      HAL_GPIO_WritePin(GPIOB, LED2_Pin, GPIO_PIN_SET); // high V -> on
-      osDelay(500); // 500 ms= 0.5 s
-      HAL_GPIO_WritePin(GPIOB, LED2_Pin, GPIO_PIN_RESET); // low V -> off
-      osDelay(500);
+      HAL_GPIO_WritePin(GPIOB, LED2_Pin, GPIO_PIN_SET);
+      osDelay(half);
+      HAL_GPIO_WritePin(GPIOB, LED2_Pin, GPIO_PIN_RESET);
+      osDelay(half);
     }
-    osMutexRelease(ledMutexHandle);                     // 還鑰匙，mutex become "待取" state
+    osMutexRelease(ledMutexHandle);
   }
   /* USER CODE END 5 */
 }
